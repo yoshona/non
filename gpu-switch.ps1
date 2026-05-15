@@ -1,7 +1,14 @@
 # gpu-switch.ps1 — Mechrevo GPU Mode Switcher for Windows
 #
-# Uses WMI ACPI calls to AMW0 device, matching the Control Center backend.
-# IGPS(1) = PCIe eject dGPU (power off), IGPS(0) = Bus Check (rescan)
+# Uses ACPI IGPS method on Embedded Controller (EC0) for GPU power control,
+# matching the Control Center backend. Falls back to PCIe hot-plug if ACPI fails.
+#
+# ACPI call chain (from DSDT analysis):
+#   IGPS(0) → Notify(RP09, BusCheck) + Notify(RP09.PXSX, BusCheck) → dGPU power on
+#   IGPS(1) → Notify(RP09.PXSX, Eject) → dGPU power off
+#
+# Called through:
+#   AMW0 (WMI device) → WMBC(Arg1=4) → OEMG → IGPS on \_SB.PC00.LPCB.EC0
 #
 # Usage:
 #   .\gpu-switch.ps1 status          Show current GPU mode
@@ -13,7 +20,7 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("status", "igpu", "dgpu", "hybrid")]
+    [ValidateSet("status", "igpu", "dgpu", "hybrid", "diagnose")]
     [string]$Command = "status",
 
     [switch]$Force,
@@ -152,23 +159,32 @@ function Find-NvidiaPciDeviceId {
 function Find-NvidiaRootPort {
     # Find the PCIe root port that the NVIDIA GPU sits behind
     $gpuId = Find-NvidiaPciDeviceId
-    if (-not $gpuId) { return $null }
+    if ($gpuId) {
+        # Walk up the device tree: GPU → PCIe bridge (if any) → Root Port
+        $currentId = $gpuId
+        for ($i = 0; $i -lt 5; $i++) {
+            $parentId = (Get-PnpDeviceProperty -InstanceId $currentId `
+                -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
+            if (-not $parentId) { break }
 
-    # Walk up the device tree: GPU → PCIe bridge (if any) → Root Port
-    $currentId = $gpuId
-    for ($i = 0; $i -lt 5; $i++) {
-        $parentId = (Get-PnpDeviceProperty -InstanceId $currentId `
-            -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data
-        if (-not $parentId) { break }
-
-        # Root ports are typically Intel (VEN_8086) or AMD (VEN_1022)
-        if ($parentId -match 'VEN_(8086|1022)') {
-            Write-Info "Root port: $parentId"
-            return $parentId
+            if ($parentId -match 'VEN_(8086|1022)') {
+                Write-Info "Root port: $parentId"
+                return $parentId
+            }
+            $currentId = $parentId
         }
-
-        $currentId = $parentId
     }
+
+    # Fallback: find Intel/AMD PCIe root port that was recently disabled
+    # (likely the one the GPU was connected to)
+    $disabledPorts = @(Get-PnpDevice -Class 'System' -Status Error -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VEN_(8086|1022).*DEV_' } |
+        Where-Object { $_.FriendlyName -match 'Port|Bridge|Root' })
+    if ($disabledPorts.Count -gt 0) {
+        Write-Info "Found disabled root port: $($disabledPorts[0].InstanceId)"
+        return $disabledPorts[0].InstanceId
+    }
+
     return $null
 }
 
@@ -207,9 +223,28 @@ function Invoke-PcieDeviceEject {
 
 function Invoke-PcieRescan {
     # Rescan PCIe bus to bring back the dGPU
-    # Equivalent to Linux: echo 1 > /sys/bus/pci/rescan
+    # Uses CM_Reenumerate_DevNode on the root port to trigger ACPI _PS0 power-on
 
-    # Method 1: pnputil /scan-devices
+    # Method 1: CM_Reenumerate_DevNode on root port (triggers ACPI power-on)
+    $rootPortId = Find-NvidiaRootPort
+    if ($rootPortId) {
+        $devInst = 0
+        $cr = [GpuSwitchApi]::CM_Locate_DevNodeW([ref]$devInst, $rootPortId, 0)
+        if ($cr -eq 0) {
+            Write-Info "Re-enumerating root port (ACPI _PS0)..."
+            $cr = [GpuSwitchApi]::CM_Reenumerate_DevNode($devInst, 0)
+            if ($cr -eq 0) {
+                Write-OK "Root port re-enumerated"
+                return $true
+            }
+            Write-Warn "CM_Reenumerate_DevNode failed (CR=$cr)"
+        }
+        else {
+            Write-Warn "CM_Locate_DevNode failed for root port (CR=$cr)"
+        }
+    }
+
+    # Method 2: pnputil /scan-devices
     try {
         Write-Info "Running pnputil /scan-devices..."
         $output = pnputil /scan-devices 2>&1
@@ -220,22 +255,535 @@ function Invoke-PcieRescan {
         Write-Warn "pnputil failed: $($_.Exception.Message)"
     }
 
-    # Method 2: CM_Reenumerate_DevNode on the root port
-    $rootPortId = Find-NvidiaRootPort
-    if ($rootPortId) {
-        $devInst = 0
-        $cr = [GpuSwitchApi]::CM_Locate_DevNodeW([ref]$devInst, $rootPortId, 0)
-        if ($cr -eq 0) {
-            Write-Info "Re-enumerating root port..."
-            $cr = [GpuSwitchApi]::CM_Reenumerate_DevNode($devInst, 0)
-            if ($cr -eq 0) {
-                return $true
-            }
-            Write-Warn "CM_Reenumerate_DevNode failed (CR=$cr)"
+    return $false
+}
+
+# --- ACPI IGPS Method Evaluation ---
+#
+# The DSDT defines IGPS on \_SB.PC00.LPCB.EC0 (Embedded Controller):
+#   IGPS(0) — Bus Check: sends Notify(RP09, 0) + Notify(RP09.PXSX, 0)
+#             to power on the dGPU and re-enumerate the PCIe slot
+#   IGPS(1) — Eject: powers off the dGPU slot
+#
+# Access path: AMW0 (PNP0C14 WMI device) → WMBC(Arg1=4) → OEMG → IGPS
+# The OEMG dispatch table uses AC00 buffer: SA00=sub-command, SAC1=0x0300=function
+
+function Invoke-AcpiIgps {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet(0, 1)]
+        [int]$Mode
+    )
+
+    $modeName = switch ($Mode) { 0 { 'Bus Check (re-enable)' } 1 { 'Eject (power off)' } }
+    Write-Info "Calling ACPI IGPS($Mode) — $modeName..."
+
+    # Method 1: WMI-ACPI method invocation through AMW0 device
+    $wmiResult = Invoke-WmiAcpiGpuMode -SubCommand $Mode -Function 0x0300
+    if ($wmiResult) {
+        Write-OK "WMI-ACPI call succeeded"
+        return $true
+    }
+
+    # Method 2: Direct ACPI IOCTL on EC0 device
+    $ioctlResult = Invoke-AcpiIgpsIoctl -Mode $Mode
+    if ($ioctlResult) {
+        return $true
+    }
+
+    Write-Warn "All ACPI method approaches failed"
+    return $false
+}
+
+function Invoke-WmiAcpiGpuMode {
+    param([int]$SubCommand, [int]$Function)
+
+    # WMI-ACPI GPU mode control through AMW0 device's AcpiTest_MULong class.
+    #
+    # DSDT analysis:
+    #   AC00 = 40-byte buffer with sub-fields:
+    #     SA00 (byte 0)  = sub-command (0=dGPU on, 1=dGPU off, 2=query)
+    #     SAC1 (dword 4) = function code (0x0300 = GPU mode control)
+    #   OEMG dispatches: SAC1==0x0300 && IGPM==1 → IGPS(SA00)
+    #
+    # WMI methods → WMBC dispatch:
+    #   GetULong     → Arg1=1 (GETC): read SACx fields
+    #   SetULong     → Arg1=2 (SETC): write SACx fields
+    #   FireULong    → Arg1=3: Store(Arg2, SAC1) + Notify (sets SAC1 only)
+    #   GetSetULong  → Arg1=4: Store(Arg2, AC00) + OEMG(AC00) → triggers IGPS
+    #
+    # Key: GetSetULong does Store(UInt64, AC00) which writes into the EXISTING
+    # 40-byte buffer (ACPICA behavior). We encode both SA00 and SAC1 in one
+    # UInt64 to set everything atomically before OEMG dispatch.
+
+    try {
+        $className = 'AcpiTest_MULong'
+        $class = Get-CimClass -Namespace root\wmi -ClassName $className -ErrorAction SilentlyContinue
+        if (-not $class) {
+            Write-Warn "$className WMI class not found"
+            return $false
         }
+
+        $instances = @(Get-CimInstance -Namespace root\wmi -ClassName $className -ErrorAction SilentlyContinue)
+        if ($instances.Count -eq 0) {
+            Write-Warn "No instances of $className found"
+            return $false
+        }
+
+        # Get method parameter names
+        $getMethod = $class.CimClassMethods | Where-Object { $_.Name -eq 'GetULong' } | Select-Object -First 1
+        $getSetMethod = $class.CimClassMethods | Where-Object { $_.Name -eq 'GetSetULong' } | Select-Object -First 1
+        $getParam = ($getMethod.Parameters | Select-Object -First 1).Name
+        $getSetParam = ($getSetMethod.Parameters | Where-Object { $_.Name -eq 'Data' } | Select-Object -First 1).Name
+        if (-not $getSetParam) { $getSetParam = ($getSetMethod.Parameters | Select-Object -First 1).Name }
+
+        $inst = $instances[0]
+
+        # Diagnostic: read current SAC1 value (instance 1 = GETC(1) → SAC1)
+        if ($instances.Count -gt 1) {
+            try {
+                $readResult = Invoke-CimMethod -InputObject $instances[1] -MethodName 'GetULong' -Arguments @{ $getParam = [uint32]0 } -ErrorAction SilentlyContinue
+                $sac1Before = $null
+                if ($readResult -is [Microsoft.Management.Infrastructure.CimInstance]) {
+                    foreach ($prop in $readResult.CimInstanceProperties) {
+                        if ($prop.Name -match 'Return|Data') { $sac1Before = $prop.Value; break }
+                    }
+                }
+                elseif ($readResult -is [System.Management.Automation.PSCustomObject]) {
+                    if ($readResult.PSObject.Properties['Return']) { $sac1Before = $readResult.PSObject.Properties['Return'].Value }
+                }
+                Write-Info "SAC1 before call: $(if ($null -ne $sac1Before) { "0x$($sac1Before.ToString('X'))" } else { 'unknown' })"
+            } catch {}
+        }
+
+        # Build UInt64 payload: SA00 (byte 0) = SubCommand, SAC1 (bytes 4-7) = Function
+        # Little-endian: byte[0]=SA00, byte[4..7]=SAC1 as DWord
+        # MUST cast to UInt64 BEFORE shift — PowerShell -shl on Int32 wraps at 32 bits
+        $funcHi = [uint64]$Function -shl 32
+        $payload = [uint64]$SubCommand -bor $funcHi
+        Write-Info "GetSetULong(0x$($payload.ToString('X16'))): SA00=$SubCommand SAC1=0x$($Function.ToString('X4'))"
+
+        $getResult = Invoke-CimMethod -InputObject $inst -MethodName 'GetSetULong' `
+            -Arguments @{ $getSetParam = $payload } -ErrorAction Stop
+
+        # Comprehensive return value logging
+        Write-Info "Result type: $($getResult.GetType().FullName)"
+        $returnValue = $null
+        if ($getResult -is [Microsoft.Management.Infrastructure.CimInstance]) {
+            foreach ($prop in $getResult.CimInstanceProperties) {
+                Write-Info "  $($prop.Name) = $($prop.Value)"
+                if ($prop.Name -match '^Return$') { $returnValue = $prop.Value }
+            }
+            if ($null -eq $returnValue) {
+                $firstProp = $getResult.CimInstanceProperties | Where-Object { $_.Name -ne 'PSComputerName' } | Select-Object -First 1
+                if ($firstProp) { $returnValue = $firstProp.Value }
+            }
+        }
+        elseif ($getResult -is [uint32] -or $getResult -is [int] -or $getResult -is [uint64]) {
+            $returnValue = $getResult
+        }
+        elseif ($getResult -is [System.Management.Automation.PSCustomObject]) {
+            # PowerShell wraps CIM results as PSCustomObject
+            Write-Info "  Properties: $($getResult.PSObject.Properties.Name -join ', ')"
+            if ($getResult.PSObject.Properties['Return']) {
+                $returnValue = $getResult.PSObject.Properties['Return'].Value
+                Write-Info "  Return = $returnValue"
+            }
+            if ($getResult.PSObject.Properties['ReturnValue']) {
+                $rvSuccess = $getResult.PSObject.Properties['ReturnValue'].Value
+                Write-Info "  ReturnValue (success) = $rvSuccess"
+            }
+        }
+        else {
+            Write-Info "Unexpected result: $($getResult | Out-String)"
+        }
+
+        # Diagnostic: read SAC1 after call
+        if ($instances.Count -gt 1) {
+            try {
+                $readResult2 = Invoke-CimMethod -InputObject $instances[1] -MethodName 'GetULong' -Arguments @{ $getParam = [uint32]0 } -ErrorAction SilentlyContinue
+                $sac1After = $null
+                if ($readResult2 -is [Microsoft.Management.Infrastructure.CimInstance]) {
+                    foreach ($prop in $readResult2.CimInstanceProperties) {
+                        if ($prop.Name -match 'Return|Data') { $sac1After = $prop.Value; break }
+                    }
+                }
+                elseif ($readResult2 -is [System.Management.Automation.PSCustomObject]) {
+                    if ($readResult2.PSObject.Properties['Return']) { $sac1After = $readResult2.PSObject.Properties['Return'].Value }
+                }
+                Write-Info "SAC1 after call: $(if ($null -ne $sac1After) { "0x$($sac1After.ToString('X'))" } else { 'unknown' })"
+            } catch {}
+        }
+
+        if ($null -ne $returnValue) {
+            Write-Info "IGPS returned: 0x$($returnValue.ToString('X')) (0=dGPU on, 1=iGPU only, 2=timeout, 0xAA=powered off via _PS3)"
+            if ($SubCommand -eq 0 -and $returnValue -eq 0) {
+                Write-OK "IGPS(0) succeeded — dGPU power signal sent!"
+            }
+            elseif ($SubCommand -eq 1 -and $returnValue -eq 1) {
+                Write-OK "IGPS(1) succeeded — dGPU powered off"
+            }
+            elseif ($returnValue -eq 0xAA -and $SubCommand -eq 1) {
+                Write-OK "IGPS(1) returned 0xAA — dGPU was active, powered off via _PS3"
+            }
+            elseif ($returnValue -eq 0xAA -and $SubCommand -eq 0) {
+                Write-Warn "IGPS(0) returned 0xAA — PXP power was ON, called _PS3 (unexpected)"
+            }
+        }
+        else {
+            Write-Warn "GetSetULong returned no value (OEMG dispatch may not have reached IGPS)"
+        }
+
+        return $true
+    }
+    catch {
+        Write-Warn "WMI GPU control failed: $($_.Exception.Message)"
+        try {
+            $class = Get-CimClass -Namespace root\wmi -ClassName 'AcpiTest_MULong' -ErrorAction SilentlyContinue
+            if ($class) {
+                foreach ($m in $class.CimClassMethods) {
+                    $ps = @($m.Parameters | ForEach-Object { "$($_.Name):$($_.CimType)" })
+                    Write-Info "  Method: $($m.Name)($($ps -join ', '))"
+                }
+            }
+        } catch {}
     }
 
     return $false
+}
+
+function Invoke-AcpiIgpsIoctl {
+    param([int]$Mode)
+
+    # Try direct ACPI IOCTL on the EC0 device
+    # Requires finding the correct device interface path
+
+    $ecDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'ACPI\\PNP0C09' })
+
+    if ($ecDevices.Count -eq 0) {
+        Write-Info "EC0 device not found for IOCTL approach"
+        return $false
+    }
+
+    $GENERIC_READ = 0x80000000
+    $GENERIC_WRITE = 0x40000000
+    $FILE_SHARE_RW = 0x03
+    $OPEN_EXISTING = 3
+
+    foreach ($ecDev in $ecDevices) {
+        # Try multiple path formats
+        $paths = @(
+            # Format 1: \\?\ prefix (extended-length path)
+            ('\\?\' + ($ecDev.InstanceId -replace '\\', '#')),
+            # Format 2: Standard device path
+            ('\\.\' + ($ecDev.InstanceId -replace '\\', '#')),
+            # Format 3: Just the hardware ID part
+            ('\\.\ACPI#PNP0C09#0'),
+            ('\\.\ACPI#PNP0C09#1')
+        )
+
+        foreach ($devicePath in $paths) {
+            $handle = [GpuSwitchApi]::CreateFile(
+                $devicePath,
+                $GENERIC_READ -bor $GENERIC_WRITE,
+                $FILE_SHARE_RW,
+                [IntPtr]::Zero,
+                $OPEN_EXISTING,
+                0,
+                [IntPtr]::Zero
+            )
+
+            if ($handle -eq [IntPtr]::new(-1)) { continue }
+
+            Write-Info "Opened EC device: $devicePath"
+            try {
+                # ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER (20 bytes)
+                $inputBuffer = New-Object byte[] 20
+                [BitConverter]::GetBytes([uint32]0x00000003).CopyTo($inputBuffer, 0)
+                [BitConverter]::GetBytes([uint32]1).CopyTo($inputBuffer, 4)
+                [System.Text.Encoding]::ASCII.GetBytes('IGPS').CopyTo($inputBuffer, 8)
+                [BitConverter]::GetBytes([uint64]$Mode).CopyTo($inputBuffer, 12)
+
+                $outputBuffer = New-Object byte[] 256
+                $bytesReturned = 0
+
+                $success = [GpuSwitchApi]::DeviceIoControl(
+                    $handle, 0x00320008,
+                    $inputBuffer, $inputBuffer.Length,
+                    $outputBuffer, $outputBuffer.Length,
+                    [ref]$bytesReturned, [IntPtr]::Zero
+                )
+
+                if ($success) {
+                    Write-OK "ACPI IGPS($Mode) evaluated successfully"
+                    return $true
+                }
+            }
+            finally {
+                [GpuSwitchApi]::CloseHandle($handle)
+            }
+        }
+    }
+
+    Write-Info "Could not open EC device for ACPI IOCTL"
+    return $false
+}
+
+function Show-Diagnose {
+    Write-Host "=== GPU Diagnostics ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Show EC0 device info
+    Write-Host "--- EC0 Device ---"
+    $ecDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'PNP0C09' })
+    foreach ($dev in $ecDevices) {
+        Write-Info "$($dev.FriendlyName): $($dev.InstanceId) [$($dev.Status)]"
+    }
+    Write-Host ""
+
+    # Show AMW0 (WMI) device info
+    Write-Host "--- AMW0 WMI Device ---"
+    $wmiDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'PNP0C14' })
+    foreach ($dev in $wmiDevices) {
+        Write-Info "$($dev.FriendlyName): $($dev.InstanceId) [$($dev.Status)]"
+    }
+    Write-Host ""
+
+    # Show WMI classes with methods in root\wmi
+    Write-Host "--- WMI Classes (root\wmi) with methods ---"
+    try {
+        $wmiClasses = @(Get-CimClass -Namespace root\wmi -ErrorAction SilentlyContinue |
+            Where-Object { $_.CimClassMethods.Count -gt 0 })
+
+        foreach ($class in $wmiClasses) {
+            $methods = @($class.CimClassMethods | ForEach-Object { $_.Name })
+            Write-Info "$($class.CimClassName): $($methods -join ', ')"
+        }
+
+        if ($wmiClasses.Count -eq 0) {
+            Write-Warn "No WMI classes with methods found in root\wmi"
+        }
+    }
+    catch {
+        Write-Err "Cannot enumerate WMI classes: $($_.Exception.Message)"
+    }
+    Write-Host ""
+
+    # Show AcpiTest_* method signatures (these are the AMW0 WMI methods)
+    Write-Host "--- AcpiTest WMI Method Signatures ---"
+    try {
+        $acpiClasses = @(Get-CimClass -Namespace root\wmi -ErrorAction SilentlyContinue |
+            Where-Object { $_.CimClassName -match 'AcpiTest' })
+
+        foreach ($class in $acpiClasses) {
+            Write-Host ""
+            Write-Info "Class: $($class.CimClassName)"
+            $instances = @(Get-CimInstance -Namespace root\wmi -ClassName $class.CimClassName -ErrorAction SilentlyContinue)
+            Write-Info "  Instances: $($instances.Count)"
+            foreach ($inst in $instances) {
+                $instProps = $inst.CimInstanceProperties | ForEach-Object { "$($_.Name)=$($_.Value)" }
+                Write-Info "  Props: $($instProps -join ', ')"
+            }
+            foreach ($method in $class.CimClassMethods) {
+                $paramList = @($method.Parameters | ForEach-Object {
+                    "$($_.Name): $($_.CimType)$($_.IsOptional ? ' (opt)' : '')" })
+                Write-Info "  $($method.Name)($($paramList -join ', '))"
+            }
+        }
+    }
+    catch {
+        Write-Err "Cannot get AcpiTest details: $($_.Exception.Message)"
+    }
+    Write-Host ""
+
+    # Show NVIDIA/root port device info
+    Write-Host "--- PCIe Devices ---"
+    $nvidiaDevs = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -ErrorAction SilentlyContinue)
+    foreach ($dev in $nvidiaDevs) {
+        Write-Info "NVIDIA: $($dev.FriendlyName) [$($dev.Status)] $($dev.InstanceId)"
+    }
+
+    $rootPorts = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VEN_8086&DEV_AE4E' })
+    foreach ($dev in $rootPorts) {
+        Write-Info "Root port: $($dev.FriendlyName) [$($dev.Status)] $($dev.InstanceId)"
+    }
+}
+
+# --- dGPU Recovery (shared by dgpu and hybrid) ---
+
+function Restore-NvidiaDGpu {
+    # Full dGPU recovery: ACPI IGPS(0) → root port power cycle → rescan → driver enable
+    # Returns the active NVIDIA display device, or $null on failure.
+    #
+    # Key insight: IGPS(0) only sends Notify when PXP._STA==0.
+    # When PXP._STA!=0 (power ON), IGPS(0) calls _PS3 which is just debug logging.
+    # The ONLY way to toggle PXP power is through Windows PnP:
+    #   Disable-PnpDevice (root port) → Windows calls PXP._OFF → PXP._STA=0
+    #   Enable-PnpDevice (root port)  → Windows calls PXP._ON  → PXP._STA=1 + hardware power-on
+
+    # Step 1: Call ACPI IGPS(0) to set IGPU=0
+    Write-Info "Step 1/4: ACPI IGPS(0)..."
+    if (-not $DryRun) {
+        Invoke-AcpiIgps -Mode 0
+        Start-Sleep -Seconds 2
+    }
+
+    # Step 2: Power cycle root port via Windows PnP (triggers PXP._OFF then PXP._ON)
+    Write-Info "Step 2/4: Power cycling root port (PXP power cycle)..."
+    $rootPortId = Find-NvidiaRootPort
+    if ($rootPortId) {
+        if (-not $DryRun) {
+            $rpDev = Get-PnpDevice -InstanceId $rootPortId -ErrorAction SilentlyContinue
+            if ($rpDev -and $rpDev.Status -eq 'OK') {
+                Write-Info "Disabling root port..."
+                Disable-PnpDevice -InstanceId $rootPortId -Confirm:$false -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+            }
+            Write-Info "Enabling root port..."
+            Enable-PnpDevice -InstanceId $rootPortId -Confirm:$false -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            $rpDev = Get-PnpDevice -InstanceId $rootPortId -ErrorAction SilentlyContinue
+            if ($rpDev -and $rpDev.Status -eq 'OK') {
+                Write-OK "Root port powered on"
+            }
+            else {
+                Write-Warn "Root port Status: $($rpDev.Status)"
+            }
+        }
+    }
+    else {
+        Write-Warn "Root port not found"
+    }
+
+    # Step 3: Remove ghost NVIDIA devices, then rescan PCIe bus
+    Write-Info "Step 3/4: Removing ghost devices and rescanning..."
+    if (-not $DryRun) {
+        $ghostDevs = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -ne 'OK' })
+        foreach ($ghost in $ghostDevs) {
+            Write-Info "Removing ghost: $($ghost.InstanceId)"
+            pnputil /remove-device $ghost.InstanceId 2>$null | Out-Null
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    Invoke-PcieRescan
+
+    # Step 4: Wait for dGPU to appear (broad search: hardware ID + display class)
+    Write-Info "Step 4/4: Waiting for dGPU to appear..."
+    $nvidiaAny = @()
+    $found = $false
+    if (-not $DryRun) {
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 2
+            # Primary: Display class with NVIDIA friendly name
+            $nvidiaAny = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
+            if ($nvidiaAny.Count -gt 0) {
+                $found = $true
+                Write-OK "dGPU detected: $($nvidiaAny[0].FriendlyName)"
+                break
+            }
+            # Secondary: Display class any status (driver not loaded yet)
+            $nvidiaAny = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue |
+                Where-Object { $_.Status -ne 'Unknown' })
+            if ($nvidiaAny.Count -gt 0) {
+                $found = $true
+                Write-OK "dGPU detected: $($nvidiaAny[0].FriendlyName) (Status: $($nvidiaAny[0].Status))"
+                break
+            }
+            # Tertiary: Any device with NVIDIA PCI vendor ID (GPU present but no driver)
+            $nvidiaAny = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+                Where-Object { $_.InstanceId -match 'VEN_10DE&DEV_2F80' })
+            if ($nvidiaAny.Count -gt 0) {
+                $found = $true
+                Write-OK "dGPU hardware detected: $($nvidiaAny[0].InstanceId) (Status: $($nvidiaAny[0].Status))"
+                break
+            }
+            Write-Info "  Waiting... ($($i+1)/20)"
+        }
+    }
+
+    if (-not $found) {
+        return $null
+    }
+
+    # Enable driver if not OK
+    $nvidiaNotOk = @($nvidiaAny | Where-Object { $_.Status -ne 'OK' })
+    if ($nvidiaNotOk.Count -gt 0) {
+        foreach ($dev in $nvidiaNotOk) {
+            try {
+                Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
+                Write-OK "Enabled: $($dev.FriendlyName)"
+                break
+            }
+            catch {
+                $output = pnputil /enable-device $dev.InstanceId 2>&1
+                if ($output -match 'successfully') {
+                    Write-OK "Enabled via pnputil"
+                    break
+                }
+                Write-Warn "Enable failed: $output"
+            }
+        }
+        Start-Sleep -Seconds 5
+    }
+
+    # Return the active Display device, or the hardware device as fallback
+    $nvidiaOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
+    if ($nvidiaOk.Count -gt 0) {
+        return $nvidiaOk[0]
+    }
+    # Hardware is on bus but Display driver not loaded — try driver recovery
+    if ($nvidiaAny.Count -gt 0 -and $nvidiaAny[0].Status -eq 'OK') {
+        Write-Info "dGPU hardware present, attempting driver recovery..."
+
+        # Try restarting NVIDIA driver service
+        try {
+            $svc = Get-Service -Name 'nvlddmkm' -ErrorAction SilentlyContinue
+            if ($svc) {
+                Write-Info "Restarting NVIDIA driver service..."
+                Restart-Service -Name 'nvlddmkm' -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+            }
+        } catch {}
+
+        $nvidiaOk2 = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
+        if ($nvidiaOk2.Count -gt 0) {
+            return $nvidiaOk2[0]
+        }
+
+        # Try enabling all NVIDIA devices found
+        $allNv = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -ne 'OK' })
+        foreach ($dev in $allNv) {
+            try {
+                Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
+                Write-OK "Enabled: $($dev.FriendlyName)"
+                break
+            } catch {}
+        }
+        Start-Sleep -Seconds 3
+
+        $nvidiaOk3 = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
+        if ($nvidiaOk3.Count -gt 0) {
+            return $nvidiaOk3[0]
+        }
+
+        # Check for Code 10 (driver mismatch with POSTed display adapter)
+        $code10 = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Error' })
+        if ($code10.Count -gt 0) {
+            Write-Warn "NVIDIA driver reports Code 10 (hot-plug driver mismatch)"
+            Write-Info "This requires a reboot for the driver to properly bind"
+        }
+
+        return $nvidiaAny[0]
+    }
+    return $null
 }
 
 # --- PnP Device Control (fallback, like OEM disableDGpu.ps1) ---
@@ -331,6 +879,7 @@ function Show-Status {
     # Determine mode
     $nvidiaOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
     $nvidiaOff = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status Error -ErrorAction SilentlyContinue)
+    $nvidiaAll = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue)
 
     if ($nvidiaOk.Count -gt 0) {
         $driver = Get-PnpDeviceProperty -InstanceId $nvidiaOk[0].InstanceId -KeyName 'DEVPKEY_Device_DriverVersion' -ErrorAction SilentlyContinue
@@ -340,7 +889,12 @@ function Show-Status {
     }
     elseif ($nvidiaOff.Count -gt 0) {
         Write-Warn "Mode: iGPU Only (dGPU disabled — still on PCIe, drawing power)"
-        Write-Info "Use -Fallback switch for WMI ACPI eject to fully power off"
+        Write-Info "Run: .\gpu-switch.ps1 igpu  to fully power off via PCIe eject"
+    }
+    elseif ($nvidiaAll.Count -gt 0) {
+        # Device present but not OK or Error — likely Unknown/Degraded (transitional state)
+        Write-Warn "Mode: Transitional (dGPU on bus, Status: $($nvidiaAll[0].Status))"
+        Write-Info "Run: .\gpu-switch.ps1 hybrid  to re-enable the driver"
     }
     else {
         Write-OK "Mode: iGPU Only (no dGPU detected — fully powered off)"
@@ -383,16 +937,34 @@ function Switch-IGpuOnly {
 
     # Step 1: Unload driver if still active
     if ($nvidiaOk.Count -gt 0) {
-        Write-Info "Step 1/2: Unloading dGPU driver..."
+        Write-Info "Step 1/3: Unloading dGPU driver..."
         Disable-NvidiaPnp
         Start-Sleep -Seconds 2
     }
     else {
-        Write-Info "Step 1/2: dGPU driver already disabled"
+        Write-Info "Step 1/3: dGPU driver already disabled"
     }
 
-    # Step 2: PCIe eject via CM_Request_Device_Eject
-    Write-Info "Step 2/2: PCIe hot-eject dGPU..."
+    # Step 2: ACPI IGPS(1) to properly power off the dGPU slot
+    # First disable the root port via Windows to ensure PXP._OFF is called,
+    # so that IGPS(1) sees PXP._STA==0 and takes the correct branch.
+    Write-Info "Step 2/3: Powering off dGPU..."
+    if (-not $DryRun) {
+        $rootPortId = Find-NvidiaRootPort
+        if ($rootPortId) {
+            $rpDev = Get-PnpDevice -InstanceId $rootPortId -ErrorAction SilentlyContinue
+            if ($rpDev -and $rpDev.Status -eq 'OK') {
+                Write-Info "Disabling root port to power off PXP..."
+                Disable-PnpDevice -InstanceId $rootPortId -Confirm:$false -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }
+        }
+        Invoke-AcpiIgps -Mode 1
+        Start-Sleep -Seconds 2
+    }
+
+    # Step 3: PCIe eject as fallback
+    Write-Info "Step 3/3: PCIe hot-eject dGPU..."
 
     if ($DryRun) {
         Write-Info "[DRY-RUN] CM_Request_Device_Eject on NVIDIA PCIe device"
@@ -403,8 +975,7 @@ function Switch-IGpuOnly {
     $gpuDeviceId = Find-NvidiaPciDeviceId
 
     if (-not $gpuDeviceId) {
-        Write-Warn "No NVIDIA PCIe device found to eject"
-        Write-Info "The dGPU may have already been removed from the bus"
+        Write-OK "No NVIDIA PCIe device found — already removed from bus"
         return
     }
 
@@ -413,22 +984,6 @@ function Switch-IGpuOnly {
 
     if ($success) {
         Write-OK "dGPU ejected from PCIe — fully powered off"
-
-        # Also try to power down the PCIe root port for maximum power savings
-        Start-Sleep -Seconds 1
-        $rootPortId = Find-NvidiaRootPort
-        if ($rootPortId) {
-            Write-Info "Powering down root port: $rootPortId"
-            # Disable the root port device to save additional power
-            $rpDev = Get-PnpDevice -InstanceId $rootPortId -ErrorAction SilentlyContinue
-            if ($rpDev -and $rpDev.Status -eq 'OK') {
-                try {
-                    Disable-PnpDevice -InstanceId $rootPortId -Confirm:$false -ErrorAction SilentlyContinue
-                    Write-OK "Root port powered down"
-                }
-                catch { }
-            }
-        }
     }
     else {
         Write-Warn "PCIe eject failed or vetoed"
@@ -441,18 +996,27 @@ function Switch-IGpuOnly {
         Write-Host "Try: Disable-PnpDevice first, then re-run this script." -ForegroundColor Cyan
     }
 
-    # Verify
+    # Verify and clean up residual devices
     Start-Sleep -Seconds 3
-    $remaining = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue |
-        Where-Object { $_.Status -eq 'OK' -or $_.Status -eq 'Error' })
+    $remaining = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue)
     if ($remaining.Count -eq 0) {
         Write-OK "Verified: dGPU fully removed from PCIe bus"
     }
-    elseif ($remaining[0].Status -eq 'Unknown') {
-        Write-OK "dGPU ejecting (device in transitional state)"
-    }
     else {
-        Write-Warn "Some NVIDIA devices still visible (Status: $($remaining[0].Status))"
+        Write-Info "Cleaning up residual NVIDIA devices (Status: $($remaining[0].Status))..."
+        foreach ($dev in $remaining) {
+            Write-Info "  Removing: $($dev.InstanceId) [$($dev.Status)]"
+            pnputil /remove-device $dev.InstanceId 2>$null | Out-Null
+        }
+        Start-Sleep -Seconds 2
+        $checkAgain = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -ErrorAction SilentlyContinue)
+        if ($checkAgain.Count -eq 0) {
+            Write-OK "dGPU fully removed from PCIe bus"
+        }
+        else {
+            Write-Warn "NVIDIA device still present: $($checkAgain[0].Status)"
+            Write-Info "dGPU may require a full power cycle to disappear"
+        }
     }
 }
 
@@ -462,38 +1026,25 @@ function Switch-DGpuOnly {
     Write-Warn "dGPU Only requires a restart (display mux switch)."
     Write-Host ""
 
-    # Ensure dGPU is enabled
-    $nvidiaOff = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status Error -ErrorAction SilentlyContinue)
-    if ($nvidiaOff.Count -gt 0) {
-        Write-Info "Enabling dGPU..."
-        Enable-NvidiaPnp
-        Start-Sleep -Seconds 3
-    }
-
+    # Check if dGPU is already active
     $nvidiaOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
+
     if ($nvidiaOk.Count -eq 0) {
-        # Try PCIe rescan
-        Write-Info "dGPU not active — trying PCIe rescan..."
-        if (-not $DryRun) {
-            # Re-enable root port if it was disabled
-            $rootPortId = Find-NvidiaRootPort
-            if ($rootPortId) {
-                $rpDev = Get-PnpDevice -InstanceId $rootPortId -ErrorAction SilentlyContinue
-                if ($rpDev -and $rpDev.Status -ne 'OK') {
-                    Enable-PnpDevice -InstanceId $rootPortId -Confirm:$false -ErrorAction SilentlyContinue
-                }
-            }
-            Invoke-PcieRescan
-            Start-Sleep -Seconds 3
+        if ($DryRun) {
+            Write-Info "[DRY-RUN] ACPI IGPS(0) + PCIe power cycle + rescan"
+            return
         }
-    }
 
-    # Verify dGPU is active
-    $nvidiaOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
-    if ($nvidiaOk.Count -eq 0) {
-        Write-Err "dGPU not detected — cannot switch to dGPU Only mode"
-        Write-Info "Make sure the Control Center is installed and dGPU hardware is present"
-        return
+        # Full recovery: ACPI Bus Check + power cycle + rescan
+        $dGpu = Restore-NvidiaDGpu
+        if (-not $dGpu) {
+            Write-Err "dGPU not detected — cannot switch to dGPU Only mode"
+            Write-Host ""
+            Write-Host "The dGPU may need a reboot to come back online." -ForegroundColor Yellow
+            Write-Host "Try: shutdown /r /t 0" -ForegroundColor Cyan
+            return
+        }
+        $nvidiaOk = @($dGpu)
     }
 
     Write-OK "dGPU is active: $($nvidiaOk[0].FriendlyName)"
@@ -501,13 +1052,11 @@ function Switch-DGpuOnly {
 
     # Set NVIDIA as preferred GPU (registry settings)
     if (-not $DryRun) {
-        # Hardware-accelerated GPU scheduling
         $dwmPath = "HKLM:\SOFTWARE\Microsoft\Windows\Dwm"
         if (Test-Path $dwmPath) {
             Set-ItemProperty -Path $dwmPath -Name "OverlayMinHardwareSupported" -Value 1 -Type DWord -ErrorAction SilentlyContinue
         }
 
-        # NVIDIA preferred renderer
         $nvPath = "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global"
         if (Test-Path $nvPath) {
             Set-ItemProperty -Path $nvPath -Name "PreferredGraphicsProcessor" -Value "HighPerformanceNVIDIA" -ErrorAction SilentlyContinue
@@ -542,49 +1091,33 @@ function Switch-Hybrid {
         return
     }
 
-    # Step 1: Try PnP enable first
-    $nvidiaOff = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status Error -ErrorAction SilentlyContinue)
-    if ($nvidiaOff.Count -gt 0) {
-        Write-Info "Step 1/2: Re-enabling dGPU driver..."
-        Enable-NvidiaPnp
-        Start-Sleep -Seconds 3
-
-        $nvidiaOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
-        if ($nvidiaOk.Count -gt 0) {
-            Write-OK "Hybrid mode active — dGPU re-enabled"
-            return
-        }
-    }
-
-    # Step 2: PCIe rescan via pnputil / CM_Reenumerate_DevNode
-    Write-Info "Step 2/2: PCIe rescan..."
-
     if ($DryRun) {
-        Write-Info "[DRY-RUN] pnputil /scan-devices + CM_Reenumerate_DevNode on root port"
+        Write-Info "[DRY-RUN] ACPI IGPS(0) + PCIe power cycle + rescan + driver enable"
         return
     }
 
-    # Re-enable root port if it was disabled during igpu mode
-    $rootPortId = Find-NvidiaRootPort
-    if ($rootPortId) {
-        $rpDev = Get-PnpDevice -InstanceId $rootPortId -ErrorAction SilentlyContinue
-        if ($rpDev -and $rpDev.Status -ne 'OK') {
-            Write-Info "Re-enabling root port..."
-            Enable-PnpDevice -InstanceId $rootPortId -Confirm:$false -ErrorAction SilentlyContinue
+    # Full recovery: ACPI IGPS(0) + root port power cycle + rescan
+    $dGpu = Restore-NvidiaDGpu
+    if ($dGpu -and $dGpu.InstanceId) {
+        # Check if the driver actually loaded (Display class with OK status)
+        $nvidiaDisplayOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
+        if ($nvidiaDisplayOk.Count -gt 0) {
+            $driver = Get-PnpDeviceProperty -InstanceId $nvidiaDisplayOk[0].InstanceId -KeyName 'DEVPKEY_Device_DriverVersion' -ErrorAction SilentlyContinue
+            Write-OK "Hybrid mode active — dGPU: $($nvidiaDisplayOk[0].FriendlyName) (driver: $($driver.Data))"
+        }
+        else {
+            # Hardware detected but driver didn't load (Code 10 — hot-plug mismatch)
+            Write-OK "dGPU hardware restored: $($dGpu.FriendlyName)"
+            Write-Warn "NVIDIA driver not loaded — reboot required for driver binding"
+            Write-Host ""
+            Write-Host "  shutdown /r /t 0" -ForegroundColor Cyan
         }
     }
-
-    Invoke-PcieRescan
-    Start-Sleep -Seconds 3
-
-    # Verify
-    $nvidiaOk = @(Get-PnpDevice -FriendlyName '*NVIDIA*' -Class Display -Status OK -ErrorAction SilentlyContinue)
-    if ($nvidiaOk.Count -gt 0) {
-        Write-OK "Hybrid mode active — dGPU: $($nvidiaOk[0].FriendlyName)"
-    }
     else {
-        Write-Warn "dGPU not yet detected after rescan"
-        Write-Info "It may need more time, or try: pnputil /scan-devices"
+        Write-Err "dGPU not detected after recovery"
+        Write-Host ""
+        Write-Host "The dGPU may need a reboot to come back online." -ForegroundColor Yellow
+        Write-Host "Try: shutdown /r /t 0" -ForegroundColor Cyan
     }
 }
 
@@ -597,8 +1130,9 @@ if (-not (Test-Admin) -and $Command -ne 'status') {
 }
 
 switch ($Command) {
-    'status' { Show-Status }
-    'igpu'   { Switch-IGpuOnly }
-    'dgpu'   { Switch-DGpuOnly }
-    'hybrid' { Switch-Hybrid }
+    'status'   { Show-Status }
+    'igpu'     { Switch-IGpuOnly }
+    'dgpu'     { Switch-DGpuOnly }
+    'hybrid'   { Switch-Hybrid }
+    'diagnose' { Show-Diagnose }
 }
