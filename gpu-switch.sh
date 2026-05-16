@@ -128,6 +128,18 @@ acpi_int() {
     parse_acpi_int "$raw"
 }
 
+acpi_probe_int() {
+    local expr=$1
+    local raw value
+
+    raw=$(acpi_raw "$expr" 2>/dev/null) || return $?
+    value=$(parse_acpi_int "$raw") || {
+        printf 'raw:%s\n' "${raw:-empty}"
+        return 0
+    }
+    printf '%s\n' "$value"
+}
+
 call_no_return_acpi() {
     local expr=$1
     local raw
@@ -161,6 +173,36 @@ pxp_state() {
     case "$value" in
         0) printf 'off' ;;
         1) printf 'on' ;;
+        *) printf 'unknown:%s' "$value" ;;
+    esac
+}
+
+dgps_status() {
+    local prefix value rc
+
+    have_acpi_call || return 2
+    for prefix in "${EC_PREFIXES[@]}"; do
+        value=$(acpi_probe_int "$prefix.DGPS") && rc=0 || rc=$?
+        [[ $rc -eq 0 ]] || continue
+        case "$value" in
+            85) printf 'off'; return 0 ;;
+            170) printf 'on'; return 0 ;;
+            raw:*) printf '%s' "$value"; return 0 ;;
+            *) printf 'unknown:%s' "$value"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+pxp_status() {
+    local value
+
+    have_acpi_call || return 2
+    value=$(acpi_probe_int "$PXP_PREFIX._STA") || return $?
+    case "$value" in
+        0) printf 'off' ;;
+        1) printf 'on' ;;
+        raw:*) printf '%s' "$value" ;;
         *) printf 'unknown:%s' "$value" ;;
     esac
 }
@@ -411,11 +453,11 @@ show_status() {
     printf "${CYAN}=== GPU Mode Status ===${NC}\n\n"
 
     if have_acpi_call; then
-        dgps=$(dgps_state 2>/dev/null || true)
-        pxp=$(pxp_state 2>/dev/null || true)
+        dgps=$(dgps_status || true)
+        pxp=$(pxp_status || true)
         printf "ACPI acpi_call: available\n"
-        printf "ACPI DGPS:      %s\n" "${dgps:-unknown}"
-        printf "ACPI PXP._STA:  %s\n" "${pxp:-unknown}"
+        printf "ACPI DGPS:      %s\n" "${dgps:-probe-failed}"
+        printf "ACPI PXP._STA:  %s\n" "${pxp:-probe-failed}"
     else
         printf "ACPI acpi_call: unavailable\n"
     fi
@@ -447,7 +489,7 @@ show_status() {
 
     printf "\nMode guess: "
     if [[ -n "$devices" && ( "${dgps:-}" == "off" || "${pxp:-}" == "off" ) ]]; then
-        printf "${YELLOW}inconsistent: ACPI says dGPU power is off, but PCI device is present${NC}\n"
+        printf "${YELLOW}hybrid with stale ACPI power state: PCI device is present${NC}\n"
     elif [[ -z "$devices" ]]; then
         printf "${GREEN}iGPU-only / dGPU absent from PCI${NC}\n"
     elif [[ "$modules" == "true" ]]; then
@@ -561,7 +603,7 @@ switch_igpu() {
 }
 
 switch_hybrid() {
-    local dev state devices
+    local dev target_dev state devices all_devs rp
 
     info "Switching to hybrid..."
     devices=$(find_nvidia_devices || true)
@@ -592,6 +634,7 @@ switch_hybrid() {
         return 1
     fi
     ok "NVIDIA device present: $dev"
+    target_dev=$dev
 
     info "Step 4/4: load NVIDIA modules"
     if load_nvidia; then
@@ -600,7 +643,15 @@ switch_hybrid() {
         warn "NVIDIA device is present, but driver stack did not load"
     fi
 
-    ok "Hybrid sequence complete: $dev driver=$(driver_of "$dev")"
+    all_devs=$(find_nvidia_devices || true)
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        set_runtime_auto "$dev"
+        rp=$(find_root_port "$dev" 2>/dev/null || true)
+        [[ -n "$rp" ]] && set_runtime_auto "$rp"
+    done <<< "$all_devs"
+
+    ok "Hybrid sequence complete: $target_dev driver=$(driver_of "$target_dev")"
 }
 
 switch_dgpu() {
