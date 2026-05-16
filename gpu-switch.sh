@@ -406,7 +406,7 @@ wait_nvidia() {
 }
 
 show_status() {
-    local dev rp modules=false dgps pxp
+    local dev rp modules=false dgps pxp devices
 
     printf "${CYAN}=== GPU Mode Status ===${NC}\n\n"
 
@@ -420,8 +420,10 @@ show_status() {
         printf "ACPI acpi_call: unavailable\n"
     fi
 
+    devices=$(find_nvidia_devices || true)
+
     printf "\nNVIDIA PCI devices:\n"
-    if [[ -z "$(find_nvidia_devices)" ]]; then
+    if [[ -z "$devices" ]]; then
         printf "  none\n"
     else
         while IFS= read -r dev; do
@@ -430,7 +432,7 @@ show_status() {
             printf "  %s  driver=%s  runtime=%s" "$dev" "$(driver_of "$dev")" "$(runtime_status_of "$dev")"
             [[ -n "$rp" ]] && printf "  root_port=%s runtime=%s" "$rp" "$(runtime_status_of "$rp")"
             printf "\n"
-        done < <(find_nvidia_devices)
+        done <<< "$devices"
     fi
 
     printf "\nNVIDIA modules:\n"
@@ -444,7 +446,9 @@ show_status() {
     done
 
     printf "\nMode guess: "
-    if [[ -z "$(find_nvidia_devices)" ]]; then
+    if [[ -n "$devices" && ( "${dgps:-}" == "off" || "${pxp:-}" == "off" ) ]]; then
+        printf "${YELLOW}inconsistent: ACPI says dGPU power is off, but PCI device is present${NC}\n"
+    elif [[ -z "$devices" ]]; then
         printf "${GREEN}iGPU-only / dGPU absent from PCI${NC}\n"
     elif [[ "$modules" == "true" ]]; then
         printf "${GREEN}hybrid / dGPU present with NVIDIA stack${NC}\n"
@@ -537,15 +541,18 @@ switch_igpu() {
 }
 
 switch_hybrid() {
-    local dev state
+    local dev state devices
 
     info "Switching to hybrid..."
+    devices=$(find_nvidia_devices || true)
 
     info "Step 1/4: set EC hybrid intent with IGPS(0)"
     igps 0 || true
 
     state=$(dgps_state 2>/dev/null || true)
-    if [[ "$state" != "on" && "$ALLOW_DIRECT_ACPI" == "true" ]]; then
+    if [[ -n "$devices" ]]; then
+        info "Step 2/4: dGPU is already present on PCI; skip direct PXP._ON"
+    elif [[ "$state" != "on" && "$ALLOW_DIRECT_ACPI" == "true" ]]; then
         info "Step 2/4: power on RP09.PXP if kernel rescan needs help"
         direct_pxp on || true
         sleep 1
