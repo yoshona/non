@@ -97,7 +97,7 @@ acpi_raw() {
     fi
 
     sleep 0.1
-    out=$(cat /proc/acpi/call 2>/dev/null || true)
+    out=$(tr -d '\000' < /proc/acpi/call 2>/dev/null || true)
     if [[ "$out" == *Error* ]]; then
         warn "ACPI '$expr' failed: $out"
         return 1
@@ -458,7 +458,7 @@ show_status() {
 }
 
 switch_igpu() {
-    local devices dev rp root_ports=() state remaining
+    local devices dev rp root_ports=() state pxp remaining finalized=false
 
     info "Switching to iGPU-only..."
     devices=$(find_nvidia_devices || true)
@@ -497,6 +497,15 @@ switch_igpu() {
     done
     sleep 1
 
+    state=$(dgps_state 2>/dev/null || true)
+    pxp=$(pxp_state 2>/dev/null || true)
+    if [[ "$state" == "off" || "$pxp" == "off" ]]; then
+        info "Firmware already reports PXP off; try IGPS(1) before PCI removal"
+        if igps 1; then
+            finalized=true
+        fi
+    fi
+
     info "Step 3/5: remove NVIDIA PCI functions"
     while IFS= read -r dev; do
         [[ -n "$dev" ]] || continue
@@ -515,13 +524,24 @@ switch_igpu() {
     info "Step 4/5: verify/force ACPI PXP off"
     sleep 1
     state=$(dgps_state 2>/dev/null || true)
-    if [[ "$state" != "off" && "$ALLOW_DIRECT_ACPI" == "true" ]]; then
+    pxp=$(pxp_state 2>/dev/null || true)
+    if [[ "$state" != "off" && "$pxp" != "off" && "$ALLOW_DIRECT_ACPI" == "true" ]]; then
         direct_pxp off || true
         sleep 1
     fi
 
     info "Step 5/5: finalize EC iGPU-only state with IGPS(1)"
-    igps 1 || true
+    if [[ "$finalized" == "true" ]]; then
+        ok "IGPS(1) already accepted before PCI removal"
+    else
+        state=$(dgps_state 2>/dev/null || true)
+        pxp=$(pxp_state 2>/dev/null || true)
+        if [[ "$state" == "off" || "$pxp" == "off" ]]; then
+            warn "Skipping late IGPS(1): PXP is already off and PCI devices were removed"
+        else
+            igps 1 || true
+        fi
+    fi
 
     if ! wait_no_nvidia; then
         remaining=$(find_nvidia_devices || true)
