@@ -1,617 +1,33 @@
-#!/bin/bash
-# gpu-switch.sh — Mechrevo GPU mode switching for Linux
+#!/usr/bin/env bash
+# Mechrevo / Tongfang GPU switch helper for Linux.
 #
-# Replicates the Windows Control Center's GPU mode switching by using
-# PCIe hot-plug, as discovered through ACPI DSDT reverse engineering.
+# This script mirrors the useful part of the Windows OEM flow:
+#   ACPI EC0.IGPS(1) -> iGPU-only intent / dGPU eject notification
+#   ACPI EC0.IGPS(0) -> hybrid intent / dGPU bus-check notification
 #
-# Usage:
-#   gpu-switch.sh status          Show current GPU mode
-#   gpu-switch.sh igpu            Switch to iGPU Only (power off dGPU)
-#   gpu-switch.sh dgpu            Switch to dGPU Only (dGPU primary, needs restart)
-#   gpu-switch.sh hybrid          Switch to Hybrid (rescan dGPU)
-#   gpu-switch.sh igpu --force    Skip confirmation prompt
-#   gpu-switch.sh dgpu --force
-#   gpu-switch.sh hybrid --force
-#
-# Requires: root, lspci, modprobe
-# Drivers:  nvidia-open (open-source NVIDIA kernel modules)
+# Linux still needs native PCI hotplug for the real device removal/rescan.
+# The script therefore uses IGPS when acpi_call is available, then verifies
+# actual PCI state through sysfs/lspci.
 
 set -euo pipefail
 
-# --- Colors ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# --- Globals ---
-NVIDIA_MODULES=("nvidia_drm" "nvidia_modeset" "nvidia_uvm" "nvidia")
+NVIDIA_MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
+ACPI_PREFIXES=('\_SB.PC00.LPCB.EC0' '\_SB.PCI0.LPCB.EC0')
+
 DRY_RUN=false
 FORCE=false
-
-# --- Helpers ---
-
-info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "This script must be run as root. Try: sudo $0 $*"
-        exit 1
-    fi
-}
-
-# Find all NVIDIA GPU PCIe addresses (full domain-padded format)
-find_nvidia_devices() {
-    lspci -D 2>/dev/null | grep -i 'vga\|3d\|display' | grep -i nvidia | awk '{print $1}' || true
-}
-
-# Find the primary NVIDIA GPU (first one)
-find_primary_nvidia() {
-    local devices
-    devices=$(find_nvidia_devices)
-    if [[ -z "$devices" ]]; then
-        return 1
-    fi
-    echo "$devices" | head -1
-}
-
-# Get the parent PCIe root port for a device
-find_parent_port() {
-    local dev=$1
-    local syspath="/sys/bus/pci/devices/$dev"
-
-    if [[ ! -L "$syspath" ]]; then
-        return 1
-    fi
-
-    # Walk up the device tree to find the root port
-    local current="$dev"
-    while true; do
-        local parent
-        parent=$(readlink "$syspath" 2>/dev/null | grep -oP '\d{4}:[0-9a-f]{2}:[0-9a-f]{2}\.\d' | tail -1)
-        if [[ -z "$parent" ]] || [[ "$parent" == "$current" ]]; then
-            break
-        fi
-        current="$parent"
-    done
-
-    # Alternative: use the pci_bus parent
-    local subsystem_vendor
-    subsystem_vendor=$(cat "/sys/bus/pci/devices/$dev/subsystem_vendor" 2>/dev/null || echo "")
-
-    # Simple approach: strip function, get parent from sysfs
-    local domain bus slot func
-    IFS=':.' read -r domain bus slot func <<< "$dev"
-    # Parent bus is one level up — look at the bridge device
-    local parent_dev
-    parent_dev=$(find /sys/bus/pci/devices/ -maxdepth 1 -lname "*/$domain:$bus:$slot.$func/.." 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
-
-    # Fallback: just return the device itself for remove operation
-    echo "$dev"
-}
-
-# Check if NVIDIA GPU is in active use
-check_gpu_in_use() {
-    local in_use=false
-
-    # Check if any process has NVIDIA device files open
-    if command -v fuser &>/dev/null; then
-        if fuser /dev/nvidia* /dev/dri/card* 2>/dev/null; then
-            in_use=true
-        fi
-    fi
-
-    # Check if nvidia module is loaded
-    if lsmod | grep -q '^nvidia '; then
-        # Check if Xorg/Wayland is using it
-        if pgrep -a Xorg &>/dev/null | grep -qi nvidia; then
-            in_use=true
-        fi
-        if pgrep -a Xwayland &>/dev/null | grep -qi nvidia; then
-            in_use=true
-        fi
-    fi
-
-    echo "$in_use"
-}
-
-# Get GPU power state from sysfs
-get_gpu_power_state() {
-    local dev=$1
-    local state_file="/sys/bus/pci/devices/$dev/power/runtime_status"
-    if [[ -f "$state_file" ]]; then
-        cat "$state_file" 2>/dev/null || echo "unknown"
-    else
-        echo "removed"
-    fi
-}
-
-# --- Commands ---
-
-cmd_status() {
-    echo -e "${CYAN}=== GPU Mode Status ===${NC}"
-    echo
-
-    # Find all GPUs
-    local all_gpus
-    all_gpus=$(lspci 2>/dev/null | grep -i 'vga\|3d\|display' || true)
-
-    if [[ -z "$all_gpus" ]]; then
-        warn "No GPU devices found"
-        return
-    fi
-
-    echo "All GPU devices:"
-    while IFS= read -r line; do
-        echo "  $line"
-    done <<< "$all_gpus"
-    echo
-
-    # Check NVIDIA specifically
-    local nvidia_devs
-    nvidia_devs=$(find_nvidia_devices)
-
-    if [[ -z "$nvidia_devs" ]]; then
-        ok "Mode: iGPU Only (dGPU not present on PCIe bus)"
-        echo
-        info "Use '$0 hybrid' to rescan and bring dGPU back"
-        return
-    fi
-
-    local primary
-    primary=$(echo "$nvidia_devs" | head -1)
-    local power_state
-    power_state=$(get_gpu_power_state "$primary")
-
-    # Check driver
-    local driver="none"
-    local driver_path="/sys/bus/pci/devices/$primary/driver"
-    if [[ -L "$driver_path" ]]; then
-        driver=$(readlink "$driver_path" | xargs basename)
-    fi
-
-    echo "NVIDIA dGPU:"
-    echo "  PCIe Address: $primary"
-    echo "  Power State:  $power_state"
-    echo "  Driver:       $driver"
-
-    # Show GPU usage
-    local in_use
-    in_use=$(check_gpu_in_use)
-    if [[ "$in_use" == "true" ]]; then
-        echo "  In Use:       ${YELLOW}YES${NC}"
-    else
-        echo "  In Use:       no"
-    fi
-
-    echo
-
-    # Determine mode
-    if [[ "$power_state" == "suspended" || "$power_state" == "off" ]]; then
-        warn "Mode: iGPU Only (dGPU suspended/off)"
-    elif [[ "$power_state" == "active" ]]; then
-        # Check if PRIME is set to nvidia (dGPU primary)
-        local prime_mode
-        prime_mode=$(get_prime_mode)
-        if [[ "$prime_mode" == "nvidia" ]]; then
-            ok "Mode: dGPU Only (dGPU is primary GPU)"
-        else
-            ok "Mode: Hybrid (dGPU active, iGPU primary)"
-        fi
-    else
-        info "Mode: Hybrid (dGPU present, state: $power_state)"
-    fi
-
-    echo
-    echo "NVIDIA kernel modules:"
-    for mod in "${NVIDIA_MODULES[@]}"; do
-        if lsmod | grep -q "^$mod "; then
-            local usage
-            usage=$(lsmod | grep "^$mod " | awk '{print $2 " users"}')
-            echo "  ${GREEN}LOAD${NC}  $mod ($usage)"
-        else
-            echo "  ${RED}----${NC}  $mod (not loaded)"
-        fi
-    done
-
-    echo
-    info "Use '$0 igpu'   to switch to iGPU Only mode"
-    info "Use '$0 dgpu'   to switch to dGPU Only mode"
-    info "Use '$0 hybrid' to switch to Hybrid mode"
-}
-
-# Detect current PRIME mode
-get_prime_mode() {
-    # Check prime-select (Ubuntu)
-    if command -v prime-select &>/dev/null; then
-        prime-select query 2>/dev/null && return
-    fi
-    # Check xorg.conf for primary GPU
-    if [[ -f /etc/X11/xorg.conf ]]; then
-        if grep -q 'Option "PrimaryGPU" "yes"' /etc/X11/xorg.conf 2>/dev/null || \
-           grep -q 'Driver "nvidia"' /etc/X11/xorg.conf 2>/dev/null; then
-            echo "nvidia"
-            return
-        fi
-    fi
-    # Check environment profile
-    if [[ -f /etc/profile.d/prime-nvidia.sh ]] || \
-       [[ -f /etc/environment.d/prime-nvidia.conf ]]; then
-        echo "nvidia"
-        return
-    fi
-    # Check if nvidia-drm modeset is active with PRIME render offload
-    if [[ -f /sys/module/nvidia_drm/parameters/modeset ]]; then
-        local modeset
-        modeset=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || echo "N")
-        if [[ "$modeset" == "Y" ]]; then
-            echo "on-demand"
-            return
-        fi
-    fi
-    echo "intel"
-}
-
-cmd_igpu() {
-    info "Switching to iGPU Only mode..."
-    echo
-
-    # Find NVIDIA devices
-    local nvidia_devs
-    nvidia_devs=$(find_nvidia_devices)
-
-    if [[ -z "$nvidia_devs" ]]; then
-        ok "Already in iGPU Only mode (no dGPU on PCIe bus)"
-        return 0
-    fi
-
-    # Check if GPU is in use
-    local in_use
-    in_use=$(check_gpu_in_use)
-
-    if [[ "$in_use" == "true" ]]; then
-        warn "GPU appears to be in active use!"
-        echo "  The following processes may be affected:"
-        fuser /dev/nvidia* /dev/dri/card* 2>/dev/null | head -5 || true
-        echo
-
-        if [[ "$FORCE" != "true" ]]; then
-            read -rp "Continue anyway? [y/N] " confirm
-            if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-                info "Aborted"
-                return 1
-            fi
-        fi
-    fi
-
-    # Step 1: Unload NVIDIA kernel modules (reverse order)
-    info "Step 1/3: Unloading NVIDIA kernel modules..."
-    local mods_to_remove=()
-    for mod in "${NVIDIA_MODULES[@]}"; do
-        if lsmod | grep -q "^$mod "; then
-            mods_to_remove+=("$mod")
-        fi
-    done
-
-    if [[ ${#mods_to_remove[@]} -gt 0 ]]; then
-        # Reverse order for unload: nvidia_drm first, nvidia last
-        for (( i=${#mods_to_remove[@]}-1; i>=0; i-- )); do
-            local mod="${mods_to_remove[$i]}"
-            if [[ "$DRY_RUN" == "true" ]]; then
-                info "[DRY-RUN] modprobe -r $mod"
-            else
-                if modprobe -r "$mod" 2>/dev/null; then
-                    ok "Unloaded $mod"
-                else
-                    warn "Failed to unload $mod (may have dependents)"
-                    # Try harder — wait and retry
-                    sleep 1
-                    if modprobe -r "$mod" 2>/dev/null; then
-                        ok "Unloaded $mod (retry)"
-                    else
-                        err "Cannot unload $mod — GPU may be in use"
-                        err "Close applications using the GPU and try again"
-                        return 1
-                    fi
-                fi
-            fi
-        done
-    else
-        ok "No NVIDIA modules loaded"
-    fi
-
-    # Step 2: Remove dGPU from PCIe bus
-    info "Step 2/3: Removing dGPU from PCIe bus..."
-    local count=0
-    while IFS= read -r dev; do
-        count=$((count + 1))
-        if [[ "$DRY_RUN" == "true" ]]; then
-            info "[DRY-RUN] echo 1 > /sys/bus/pci/devices/$dev/remove"
-        else
-            echo 1 > "/sys/bus/pci/devices/$dev/remove" 2>/dev/null && \
-                ok "Removed $dev" || \
-                warn "Failed to remove $dev"
-        fi
-    done <<< "$nvidia_devs"
-
-    # Also remove the PCIe bridge for the dGPU if it exists
-    # This saves more power (equivalent to RP09._PS3 in ACPI)
-    local bridge_devs
-    bridge_devs=$(lspci -D 2>/dev/null | grep -i 'pci bridge' | grep -i nvidia | awk '{print $1}' || true)
-    if [[ -n "$bridge_devs" ]]; then
-        while IFS= read -r bdev; do
-            if [[ -e "/sys/bus/pci/devices/$bdev" ]]; then
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    info "[DRY-RUN] echo 1 > /sys/bus/pci/devices/$bdev/remove (PCIe bridge)"
-                else
-                    echo 1 > "/sys/bus/pci/devices/$bdev/remove" 2>/dev/null && \
-                        ok "Removed PCIe bridge $bdev" || true
-                fi
-            fi
-        done <<< "$bridge_devs"
-    fi
-
-    # Step 3: Verify
-    info "Step 3/3: Verifying..."
-    sleep 0.5
-    local remaining
-    remaining=$(find_nvidia_devices)
-    if [[ -z "$remaining" ]]; then
-        ok "Successfully switched to iGPU Only mode"
-        ok "Power saving: dGPU fully disconnected from PCIe bus"
-    else
-        warn "Some NVIDIA devices still present:"
-        while IFS= read -r line; do
-            warn "  $line"
-        done <<< "$(lspci | grep -i nvidia)"
-    fi
-}
-
-cmd_hybrid() {
-    info "Switching to Hybrid mode..."
-    echo
-
-    # Check if dGPU is already present
-    local nvidia_devs
-    nvidia_devs=$(find_nvidia_devices)
-
-    if [[ -n "$nvidia_devs" ]]; then
-        local primary
-        primary=$(echo "$nvidia_devs" | head -1)
-        local driver_path="/sys/bus/pci/devices/$primary/driver"
-        if [[ -L "$driver_path" ]]; then
-            ok "Already in Hybrid mode (dGPU present and driven)"
-            return 0
-        fi
-    fi
-
-    # Step 1: Rescan PCIe bus
-    info "Step 1/3: Rescanning PCIe bus..."
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY-RUN] echo 1 > /sys/bus/pci/rescan"
-    else
-        echo 1 > /sys/bus/pci/rescan
-    fi
-
-    # Step 2: Wait for dGPU to appear
-    info "Step 2/3: Waiting for dGPU to appear..."
-    local found=false
-    for i in $(seq 1 20); do
-        sleep 0.5
-        nvidia_devs=$(find_nvidia_devices)
-        if [[ -n "$nvidia_devs" ]]; then
-            found=true
-            ok "dGPU detected: $(echo "$nvidia_devs" | head -1)"
-            break
-        fi
-        printf "  Waiting... (%d/20)\r" "$i"
-    done
-    echo
-
-    if [[ "$found" != "true" ]]; then
-        err "dGPU not detected after rescan"
-        err "Try: echo 1 > /sys/bus/pci/rescan"
-        err "Or check if the PCIe root port was also removed"
-        return 1
-    fi
-
-    # Step 3: Load NVIDIA driver
-    info "Step 3/3: Loading NVIDIA kernel modules..."
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY-RUN] modprobe nvidia"
-    else
-        if modprobe nvidia 2>/dev/null; then
-            ok "Loaded nvidia module"
-            # Load dependent modules
-            modprobe nvidia_modeset 2>/dev/null || true
-            modprobe nvidia_drm 2>/dev/null || true
-            modprobe nvidia_uvm 2>/dev/null || true
-        else
-            warn "nvidia module load failed — dGPU is present but unmanaged"
-            warn "You may need to manually load: modprobe nvidia"
-        fi
-    fi
-
-    # Verify
-    sleep 1
-    local primary
-    primary=$(find_primary_nvidia)
-    if [[ -n "$primary" ]]; then
-        local driver="none"
-        if [[ -L "/sys/bus/pci/devices/$primary/driver" ]]; then
-            driver=$(readlink "/sys/bus/pci/devices/$primary/driver" | xargs basename)
-        fi
-        ok "Hybrid mode active — dGPU: $primary, driver: $driver"
-    else
-        err "dGPU disappeared after driver load"
-        return 1
-    fi
-}
-
-cmd_dgpu() {
-    info "Switching to dGPU Only mode..."
-    echo
-    warn "This mode sets dGPU as the primary GPU."
-    warn "A display manager restart (or reboot) is required to take full effect."
-    echo
-
-    # Step 1: Ensure dGPU is present and driven (reuse hybrid logic)
-    local nvidia_devs
-    nvidia_devs=$(find_nvidia_devices)
-
-    if [[ -z "$nvidia_devs" ]]; then
-        info "dGPU not found — rescanning PCIe bus..."
-        if [[ "$DRY_RUN" == "true" ]]; then
-            info "[DRY-RUN] echo 1 > /sys/bus/pci/rescan"
-        else
-            echo 1 > /sys/bus/pci/rescan
-        fi
-
-        # Wait for dGPU to appear
-        local found=false
-        for i in $(seq 1 20); do
-            sleep 0.5
-            nvidia_devs=$(find_nvidia_devices)
-            if [[ -n "$nvidia_devs" ]]; then
-                found=true
-                ok "dGPU detected: $(echo "$nvidia_devs" | head -1)"
-                break
-            fi
-            printf "  Waiting... (%d/20)\r" "$i"
-        done
-        echo
-
-        if [[ "$found" != "true" ]]; then
-            err "dGPU not detected after rescan"
-            return 1
-        fi
-    fi
-
-    # Load drivers if not already loaded
-    local primary
-    primary=$(echo "$nvidia_devs" | head -1)
-    local driver_path="/sys/bus/pci/devices/$primary/driver"
-
-    if [[ ! -L "$driver_path" ]]; then
-        info "Loading NVIDIA kernel modules..."
-        if [[ "$DRY_RUN" == "true" ]]; then
-            info "[DRY-RUN] modprobe nvidia nvidia_modeset nvidia_drm nvidia_uvm"
-        else
-            modprobe nvidia 2>/dev/null || true
-            modprobe nvidia_modeset 2>/dev/null || true
-            modprobe nvidia_drm 2>/dev/null || true
-            modprobe nvidia_uvm 2>/dev/null || true
-        fi
-        sleep 1
-    fi
-
-    ok "dGPU online: $primary"
-    echo
-
-    # Step 2: Configure PRIME — set dGPU as primary
-    info "Step 2/3: Configuring PRIME to use dGPU as primary..."
-
-    if [[ "$DRY_RUN" == "true" ]]; then
-        info "[DRY-RUN] Configure dGPU as primary GPU"
-    else
-        # Method 1: prime-select (Ubuntu)
-        if command -v prime-select &>/dev/null; then
-            prime-select nvidia 2>/dev/null && \
-                ok "Set PRIME to nvidia via prime-select" || \
-                warn "prime-select nvidia failed (may need reboot)"
-        else
-            # Method 2: Create xorg.conf
-            local xconf="/etc/X11/xorg.conf.d/10-nvidia-prime.conf"
-            local xconf_dir
-            xconf_dir=$(dirname "$xconf")
-
-            if [[ ! -d "$xconf_dir" ]]; then
-                mkdir -p "$xconf_dir"
-            fi
-
-            cat > "$xconf" <<'XORG'
-# Generated by gpu-switch.sh — dGPU Only mode
-Section "OutputClass"
-    Identifier "nvidia"
-    MatchDriver "nvidia-drm"
-    Driver "nvidia"
-    Option "PrimaryGPU" "yes"
-    Option "AllowEmptyInitialConfiguration" "yes"
-    ModulePath "/usr/lib/x86_64-linux-gnu/nvidia/xorg"
-EndSection
-XORG
-            ok "Wrote xorg.conf.d/10-nvidia-prime.conf (PrimaryGPU=nvidia)"
-        fi
-
-        # Enable nvidia-drm modeset for Wayland compatibility
-        if [[ -d /etc/modprobe.d ]]; then
-            cat > /etc/modprobe.d/nvidia-dgpu.conf <<'MODPROBE'
-# Generated by gpu-switch.sh — dGPU Only mode
-options nvidia-drm modeset=1 fbdev=1
-MODPROBE
-            ok "Set nvidia-drm modeset=1 for Wayland support"
-        fi
-
-        # Set udev rule for PRIME render offload (always use dGPU)
-        if [[ -d /etc/udev/rules.d ]]; then
-            cat > /etc/udev/rules.d/80-nvidia-dgpu.rules <<'UDEV'
-# Generated by gpu-switch.sh — dGPU Only mode
-ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{power/control}="on"
-UDEV
-            ok "Set udev rule to keep dGPU powered on"
-        fi
-
-        # Disable runtime D3 (power saving) so dGPU stays awake
-        for dev in $nvidia_devs; do
-            local pwr="/sys/bus/pci/devices/$dev/power/control"
-            if [[ -f "$pwr" ]]; then
-                echo "on" > "$pwr" 2>/dev/null || true
-            fi
-        done
-        ok "Disabled dGPU runtime power management (always on)"
-    fi
-
-    echo
-
-    # Step 3: Verify and prompt restart
-    info "Step 3/3: Verifying configuration..."
-    local prime_mode
-    prime_mode=$(get_prime_mode)
-    ok "PRIME mode: $prime_mode"
-    ok "dGPU Only mode configured"
-    echo
-
-    echo -e "${YELLOW}=== Action Required ===${NC}"
-    echo "  The display server must restart for changes to take effect."
-    echo "  Options (from least to most disruptive):"
-    echo ""
-    echo "    1. Log out and log back in"
-    echo "    2. sudo systemctl restart display-manager"
-    echo "    3. sudo reboot"
-    echo ""
-
-    if [[ "$FORCE" != "true" ]]; then
-        read -rp "Restart display manager now? [y/N] " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            if [[ "$DRY_RUN" == "true" ]]; then
-                info "[DRY-RUN] systemctl restart display-manager"
-            else
-                info "Restarting display manager..."
-                systemctl restart display-manager 2>/dev/null || \
-                    systemctl restart gdm 2>/dev/null || \
-                    systemctl restart sddm 2>/dev/null || \
-                    systemctl restart lightdm 2>/dev/null || \
-                    warn "Could not restart display manager — please reboot manually"
-            fi
-        fi
-    fi
-}
-
-# --- Main ---
+PCI_ADDR=""
+
+info() { printf "${CYAN}[INFO]${NC}  %s\n" "$*"; }
+ok() { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
+warn() { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
+err() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 
 usage() {
     cat <<EOF
@@ -620,22 +36,525 @@ Mechrevo GPU Mode Switcher for Linux
 Usage: $(basename "$0") <command> [options]
 
 Commands:
-  status    Show current GPU mode and dGPU status
-  igpu      Switch to iGPU Only mode (disconnect dGPU)
-  dgpu      Switch to dGPU Only mode (dGPU primary, needs restart)
-  hybrid    Switch to Hybrid mode (reconnect dGPU)
+  status       Show dGPU, ACPI, and module state
+  igpu         Switch to iGPU-only by unloading NVIDIA and removing dGPU PCI
+  hybrid       Switch to hybrid by ACPI IGPS(0), PCI rescan, and driver load
+  dgpu         Alias for hybrid, then prints display-manager guidance
 
 Options:
-  --dry-run   Show what would be done without executing
-  --force     Skip confirmation prompts
-  -h, --help  Show this help
+  --pci ADDR   Use a specific NVIDIA PCI address, e.g. 0000:01:00.0
+  --dry-run    Print actions without writing to ACPI/sysfs
+  --force      Skip interactive safety prompts
+  -h, --help   Show this help
 
-Examples:
-  sudo $(basename "$0") status
-  sudo $(basename "$0") igpu
-  sudo $(basename "$0") dgpu --force
-  sudo $(basename "$0") hybrid
+Notes:
+  - For OEM ACPI control, load acpi_call first:
+      sudo modprobe acpi_call
+  - The script does not write persistent Xorg, udev, or modprobe config.
 EOF
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        err "Missing required command: $1"
+        exit 1
+    }
+}
+
+check_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        err "This command must be run as root. Try: sudo $0 $*"
+        exit 1
+    fi
+}
+
+sysfs_write() {
+    local path=$1
+    local value=$2
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] write '$value' -> $path"
+        return 0
+    fi
+
+    if [[ ! -e "$path" ]]; then
+        warn "Missing sysfs path: $path"
+        return 1
+    fi
+
+    if printf '%s\n' "$value" > "$path" 2>/dev/null; then
+        return 0
+    fi
+
+    err "Failed to write '$value' to $path"
+    return 1
+}
+
+find_nvidia_devices() {
+    if [[ -n "$PCI_ADDR" ]]; then
+        if [[ "$DRY_RUN" == "true" || -e "/sys/bus/pci/devices/$PCI_ADDR" ]]; then
+            printf '%s\n' "$PCI_ADDR"
+        fi
+        return 0
+    fi
+
+    if command -v lspci >/dev/null 2>&1; then
+        lspci -D -d 10de: 2>/dev/null | awk '{print $1}'
+        return 0
+    fi
+
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/vendor" ]] || continue
+        [[ "$(cat "$dev/vendor" 2>/dev/null)" == "0x10de" ]] || continue
+        basename "$dev"
+    done
+}
+
+find_primary_nvidia() {
+    find_nvidia_devices | head -n 1
+}
+
+device_driver() {
+    local dev=$1
+    local link="/sys/bus/pci/devices/$dev/driver"
+    if [[ -L "$link" ]]; then
+        basename "$(readlink -f "$link")"
+    else
+        printf 'none'
+    fi
+}
+
+runtime_status() {
+    local dev=$1
+    local path="/sys/bus/pci/devices/$dev/power/runtime_status"
+    if [[ -r "$path" ]]; then
+        cat "$path"
+    elif [[ -e "/sys/bus/pci/devices/$dev" ]]; then
+        printf 'present'
+    else
+        printf 'removed'
+    fi
+}
+
+find_root_port() {
+    local dev=$1
+    local real
+
+    real=$(readlink -f "/sys/bus/pci/devices/$dev" 2>/dev/null || true)
+    [[ -n "$real" ]] || return 1
+
+    local current
+    current=$(dirname "$real")
+    while [[ "$current" == /sys/devices/* ]]; do
+        local name class vendor
+        name=$(basename "$current")
+        [[ "$name" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] || {
+            current=$(dirname "$current")
+            continue
+        }
+
+        class=$(cat "$current/class" 2>/dev/null || true)
+        vendor=$(cat "$current/vendor" 2>/dev/null || true)
+        if [[ "$class" == 0x0604* && "$vendor" =~ ^0x(8086|1022)$ ]]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+        current=$(dirname "$current")
+    done
+
+    return 1
+}
+
+acpi_available() {
+    [[ -e /proc/acpi/call ]]
+}
+
+parse_acpi_hex() {
+    local value=$1
+    value=${value//$'\0'/}
+    value=${value//$'\n'/ }
+
+    if [[ "$value" =~ Error ]]; then
+        return 1
+    fi
+    if [[ "$value" =~ 0[xX]([0-9a-fA-F]+) ]]; then
+        printf '%d\n' "0x${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$value" =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+        printf '%d\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+acpi_eval() {
+    local expr=$1
+    local result
+
+    if ! acpi_available; then
+        return 2
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        printf "${CYAN}[INFO]${NC}  [DRY-RUN] ACPI: %s\n" "$expr" >&2
+        printf '0\n'
+        return 0
+    fi
+
+    if ! printf '%s\n' "$expr" > /proc/acpi/call 2>/dev/null; then
+        return 1
+    fi
+
+    sleep 0.1
+    result=$(cat /proc/acpi/call 2>/dev/null || true)
+    if parse_acpi_hex "$result"; then
+        return 0
+    fi
+
+    warn "ACPI call failed for '$expr': ${result:-empty result}"
+    return 1
+}
+
+call_igps() {
+    local mode=$1
+    local prefix result rc
+
+    if ! acpi_available; then
+        warn "acpi_call is not available; skipping IGPS($mode)"
+        return 2
+    fi
+
+    for prefix in "${ACPI_PREFIXES[@]}"; do
+        result=$(acpi_eval "$prefix.IGPS $mode") && rc=0 || rc=$?
+        [[ $rc -eq 0 ]] || continue
+
+        case "$result" in
+            0)
+                if [[ "$mode" == "0" ]]; then
+                    ok "IGPS(0) via $prefix returned 0: dGPU power-on/bus-check requested"
+                    return 0
+                fi
+                warn "IGPS(1) via $prefix returned 0: unexpected state"
+                return 1
+                ;;
+            1)
+                if [[ "$mode" == "1" ]]; then
+                    ok "IGPS(1) via $prefix returned 1: iGPU-only state accepted"
+                    return 0
+                fi
+                warn "IGPS(0) via $prefix returned 1: unexpected state"
+                return 1
+                ;;
+            2)
+                warn "IGPS($mode) via $prefix returned 2: firmware timed out waiting for D3"
+                return 1
+                ;;
+            170)
+                warn "IGPS($mode) via $prefix returned 0xAA: firmware only hit debug _PS3 path"
+                return 1
+                ;;
+            *)
+                warn "IGPS($mode) via $prefix returned unknown value: $result"
+                return 1
+                ;;
+        esac
+    done
+
+    warn "IGPS($mode) failed on all known ACPI paths"
+    return 1
+}
+
+query_dgps() {
+    local prefix result rc
+
+    acpi_available || return 2
+    for prefix in "${ACPI_PREFIXES[@]}"; do
+        result=$(acpi_eval "$prefix.DGPS") && rc=0 || rc=$?
+        [[ $rc -eq 0 ]] || continue
+        case "$result" in
+            85) printf 'off'; return 0 ;;
+            170) printf 'on'; return 0 ;;
+            *) printf 'unknown(%s)' "$result"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+gpu_in_use() {
+    local dev=$1
+    local driver
+    driver=$(device_driver "$dev")
+
+    if [[ "$driver" != nvidia* ]]; then
+        return 1
+    fi
+
+    if command -v fuser >/dev/null 2>&1; then
+        if fuser /dev/nvidia* >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]'; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+unload_nvidia_modules() {
+    local mod
+
+    for mod in "${NVIDIA_MODULES[@]}"; do
+        if [[ ! -d "/sys/module/$mod" ]]; then
+            continue
+        fi
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "[DRY-RUN] modprobe -r $mod"
+            continue
+        fi
+
+        if modprobe -r "$mod" 2>/tmp/gpu-switch-modprobe.err; then
+            ok "Unloaded $mod"
+        else
+            err "Cannot unload $mod"
+            sed 's/^/  /' /tmp/gpu-switch-modprobe.err >&2 || true
+            return 1
+        fi
+    done
+}
+
+load_nvidia_modules() {
+    local mod
+
+    for mod in nvidia nvidia_modeset nvidia_drm nvidia_uvm; do
+        if [[ "$DRY_RUN" == "true" ]]; then
+            info "[DRY-RUN] modprobe $mod"
+            continue
+        fi
+        modprobe "$mod" 2>/dev/null || true
+    done
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ -d /sys/module/nvidia ]]; then
+        ok "NVIDIA module loaded"
+        return 0
+    fi
+
+    warn "NVIDIA hardware is present, but the nvidia module is not loaded"
+    return 1
+}
+
+remove_pci_device() {
+    local dev=$1
+    local path="/sys/bus/pci/devices/$dev/remove"
+    sysfs_write "$path" 1
+}
+
+pci_rescan() {
+    sysfs_write /sys/bus/pci/rescan 1
+}
+
+wait_for_no_nvidia() {
+    local i
+    if [[ "$DRY_RUN" == "true" ]]; then
+        printf "${CYAN}[INFO]${NC}  [DRY-RUN] assume NVIDIA PCI devices disappear\n" >&2
+        return 0
+    fi
+
+    for i in {1..20}; do
+        if [[ -z "$(find_nvidia_devices)" ]]; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+wait_for_nvidia() {
+    local i found
+    if [[ "$DRY_RUN" == "true" ]]; then
+        printf "${CYAN}[INFO]${NC}  [DRY-RUN] assume NVIDIA PCI device appears\n" >&2
+        printf '%s\n' "${PCI_ADDR:-0000:01:00.0}"
+        return 0
+    fi
+
+    for i in {1..30}; do
+        found=$(find_primary_nvidia || true)
+        if [[ -n "$found" ]]; then
+            printf '%s\n' "$found"
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+cmd_status() {
+    local dev dgps modules
+
+    printf "${CYAN}=== GPU Mode Status ===${NC}\n\n"
+
+    if acpi_available; then
+        dgps=$(query_dgps 2>/dev/null || true)
+        printf "ACPI acpi_call: available\n"
+        printf "ACPI DGPS:      %s\n" "${dgps:-unknown}"
+    else
+        printf "ACPI acpi_call: unavailable\n"
+    fi
+
+    printf "\nNVIDIA PCI devices:\n"
+    if [[ -z "$(find_nvidia_devices)" ]]; then
+        printf "  none\n"
+    else
+        while IFS= read -r dev; do
+            [[ -n "$dev" ]] || continue
+            printf "  %s  driver=%s  runtime=%s" "$dev" "$(device_driver "$dev")" "$(runtime_status "$dev")"
+            local rp
+            rp=$(find_root_port "$dev" 2>/dev/null || true)
+            [[ -n "$rp" ]] && printf "  root_port=%s" "$rp"
+            printf "\n"
+        done < <(find_nvidia_devices)
+    fi
+
+    printf "\nNVIDIA modules:\n"
+    modules=false
+    for mod in "${NVIDIA_MODULES[@]}"; do
+        if [[ -d "/sys/module/$mod" ]]; then
+            modules=true
+            printf "  %-14s loaded\n" "$mod"
+        else
+            printf "  %-14s not loaded\n" "$mod"
+        fi
+    done
+
+    printf "\nMode guess: "
+    if [[ -z "$(find_nvidia_devices)" ]]; then
+        printf "${GREEN}iGPU-only${NC} (NVIDIA absent from PCI bus)\n"
+    elif [[ "$modules" == "true" ]]; then
+        printf "${GREEN}hybrid/dGPU-present${NC}\n"
+    else
+        printf "${YELLOW}dGPU present without NVIDIA driver${NC}\n"
+    fi
+}
+
+cmd_igpu() {
+    local devices dev root_ports=() rp remaining dgps
+
+    info "Switching to iGPU-only mode..."
+    devices=$(find_nvidia_devices)
+    if [[ -z "$devices" ]]; then
+        ok "Already iGPU-only: no NVIDIA PCI device is present"
+        return 0
+    fi
+
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        rp=$(find_root_port "$dev" 2>/dev/null || true)
+        [[ -n "$rp" ]] && root_ports+=("$rp")
+        if gpu_in_use "$dev"; then
+            warn "NVIDIA device $dev appears to be in use"
+            if [[ "$FORCE" != "true" ]]; then
+                read -r -p "Continue and remove it anyway? [y/N] " answer
+                [[ "$answer" == "y" || "$answer" == "Y" ]] || {
+                    info "Aborted"
+                    return 1
+                }
+            fi
+        fi
+    done <<< "$devices"
+
+    info "Step 1/4: unload NVIDIA modules"
+    unload_nvidia_modules
+
+    info "Step 2/4: request OEM iGPU-only state"
+    call_igps 1 || true
+
+    info "Step 3/4: remove NVIDIA PCI functions"
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        if [[ "$DRY_RUN" == "true" || -e "/sys/bus/pci/devices/$dev" ]]; then
+            remove_pci_device "$dev" && ok "Removed NVIDIA PCI function $dev" || true
+        fi
+    done <<< "$devices"
+
+    if ((${#root_ports[@]} > 0)); then
+        for rp in "${root_ports[@]}"; do
+            if [[ "$DRY_RUN" == "true" || -e "/sys/bus/pci/devices/$rp/remove" ]]; then
+                remove_pci_device "$rp" && ok "Removed parent root port $rp" || true
+            fi
+        done
+    fi
+
+    info "Step 4/4: request OEM iGPU-only state again and verify"
+    call_igps 1 || true
+
+    if wait_for_no_nvidia; then
+        ok "No NVIDIA PCI devices remain"
+    else
+        remaining=$(find_nvidia_devices)
+        err "NVIDIA PCI devices are still present:"
+        printf '%s\n' "$remaining" | sed 's/^/  /' >&2
+        return 1
+    fi
+
+    dgps=$(query_dgps 2>/dev/null || true)
+    if [[ "$dgps" == "off" ]]; then
+        ok "ACPI DGPS reports dGPU off"
+    elif [[ -n "$dgps" ]]; then
+        warn "ACPI DGPS reports '$dgps' after PCI removal"
+    fi
+
+    ok "iGPU-only switch complete"
+}
+
+cmd_hybrid() {
+    local dev dgps
+
+    info "Switching to hybrid mode..."
+
+    info "Step 1/4: request OEM hybrid state"
+    call_igps 0 || true
+
+    info "Step 2/4: rescan PCI bus"
+    pci_rescan || true
+
+    info "Step 3/4: wait for NVIDIA PCI device"
+    if ! dev=$(wait_for_nvidia); then
+        call_igps 0 || true
+        pci_rescan || true
+        dev=$(wait_for_nvidia || true)
+    fi
+
+    if [[ -z "$dev" ]]; then
+        dgps=$(query_dgps 2>/dev/null || true)
+        err "dGPU did not appear after ACPI IGPS(0) and PCI rescan"
+        [[ -n "$dgps" ]] && err "ACPI DGPS currently reports: $dgps"
+        err "A cold reboot may be required if the platform removed the root port deeply"
+        return 1
+    fi
+
+    ok "Detected NVIDIA PCI device: $dev"
+
+    info "Step 4/4: load NVIDIA driver modules"
+    load_nvidia_modules || true
+
+    ok "Hybrid switch complete: $dev driver=$(device_driver "$dev")"
+}
+
+cmd_dgpu() {
+    cmd_hybrid
+    printf "\n"
+    warn "dGPU-only display routing is a MUX/display-manager policy, not just PCI power."
+    warn "This script only restores the dGPU to the PCI bus and loads the driver."
+    info "Use your distro's PRIME/MUX tooling, then log out or reboot if needed."
 }
 
 main() {
@@ -643,9 +562,17 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            status|igpu|dgpu|hybrid)
-                command="$1"
+            status|igpu|hybrid|dgpu)
+                command=$1
                 shift
+                ;;
+            --pci)
+                [[ $# -ge 2 ]] || {
+                    err "--pci requires an address"
+                    exit 1
+                }
+                PCI_ADDR=$2
+                shift 2
                 ;;
             --dry-run)
                 DRY_RUN=true
@@ -672,16 +599,17 @@ main() {
         exit 1
     fi
 
-    # status doesn't need root
-    if [[ "$command" != "status" ]]; then
+    need_cmd awk
+    if [[ "$command" != "status" && "$DRY_RUN" != "true" ]]; then
         check_root "$command"
+        need_cmd modprobe
     fi
 
     case "$command" in
         status) cmd_status ;;
-        igpu)   cmd_igpu ;;
-        dgpu)   cmd_dgpu ;;
+        igpu) cmd_igpu ;;
         hybrid) cmd_hybrid ;;
+        dgpu) cmd_dgpu ;;
     esac
 }
 
