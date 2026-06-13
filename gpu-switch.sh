@@ -366,6 +366,17 @@ set_runtime_auto() {
     sysfs_write "/sys/bus/pci/devices/$dev/power/control" auto || true
 }
 
+unbind_driver() {
+    local dev=$1
+    local driver_link="/sys/bus/pci/devices/$dev/driver"
+    if [[ -L "$driver_link" ]]; then
+        if ! timeout 5 bash -c "printf '%s\n' '$dev' > '/sys/bus/pci/devices/$dev/driver/unbind'" 2>/dev/null; then
+            warn "Unbind of $dev timed out (device may be busy), will retry after module unload"
+            return 1
+        fi
+    fi
+}
+
 remove_device() {
     local dev=$1
     sysfs_write "/sys/bus/pci/devices/$dev/remove" 1
@@ -375,17 +386,71 @@ pci_rescan() {
     sysfs_write /sys/bus/pci/rescan 1
 }
 
+nvidia_render_nodes() {
+    local node vendor
+    for node in /sys/class/drm/renderD*; do
+        [[ -r "$node/device/vendor" ]] || continue
+        vendor=$(cat "$node/device/vendor" 2>/dev/null || true)
+        [[ "$vendor" == "0x10de" ]] || continue
+        printf '/dev/%s\n' "$(basename "$node")"
+    done
+}
+
+nvidia_video_memory_active() {
+    local path
+    for path in /proc/driver/nvidia/gpus/*/power; do
+        [[ -r "$path" ]] || continue
+        grep -q '^Video Memory:[[:space:]]*Active' "$path" 2>/dev/null && return 0
+    done
+    return 1
+}
+
 gpu_in_use() {
-    local dev=$1
+    local dev=$1 node
     [[ "$(driver_of "$dev")" == nvidia* ]] || return 1
 
-    if command -v fuser >/dev/null 2>&1 && fuser /dev/nvidia* >/dev/null 2>&1; then
-        return 0
+    if command -v fuser >/dev/null 2>&1; then
+        fuser /dev/nvidia* >/dev/null 2>&1 && return 0
+        while IFS= read -r node; do
+            [[ -n "$node" ]] || continue
+            fuser "$node" >/dev/null 2>&1 && return 0
+        done < <(nvidia_render_nodes)
     fi
     if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]' && return 0
     fi
+    nvidia_video_memory_active && return 0
     return 1
+}
+
+stop_nvidia_persistenced() {
+    if systemctl is-active nvidia-persistenced >/dev/null 2>&1; then
+        info "Stopping nvidia-persistenced service"
+        systemctl stop nvidia-persistenced 2>/dev/null || \
+            warn "Could not stop nvidia-persistenced via systemctl"
+    fi
+}
+
+stop_nvidia_powerd() {
+    if systemctl is-active nvidia-powerd >/dev/null 2>&1; then
+        info "Stopping nvidia-powerd service (it owns dGPU power/runtime PM)"
+        systemctl stop nvidia-powerd 2>/dev/null || \
+            warn "Could not stop nvidia-powerd via systemctl"
+    fi
+}
+
+start_nvidia_services() {
+    local svc
+    for svc in nvidia-persistenced nvidia-powerd; do
+        if ! systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+            continue
+        fi
+        if systemctl is-active "$svc" >/dev/null 2>&1; then
+            continue
+        fi
+        info "Starting $svc service"
+        systemctl start "$svc" 2>/dev/null || warn "Could not start $svc via systemctl"
+    done
 }
 
 unload_nvidia() {
@@ -526,10 +591,19 @@ switch_igpu() {
         [[ -n "$rp" ]] && root_ports+=("$rp")
     done <<< "$devices"
 
-    info "Step 1/5: unload NVIDIA modules"
-    unload_nvidia
+    info "Step 1/5: stop nvidia-persistenced/nvidia-powerd and unbind NVIDIA devices"
+    stop_nvidia_persistenced
+    stop_nvidia_powerd
+    while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        if unbind_driver "$dev"; then
+            ok "Unbound $dev from driver"
+        else
+            warn "Could not unbind $dev (may be busy); will retry via modprobe -r"
+        fi
+    done <<< "$devices"
 
-    info "Step 2/5: allow Linux runtime PM on dGPU/root port"
+    info "Step 2/5: set runtime PM, then unload NVIDIA modules"
     while IFS= read -r dev; do
         [[ -n "$dev" ]] || continue
         set_runtime_auto "$dev"
@@ -537,6 +611,7 @@ switch_igpu() {
     for rp in "${root_ports[@]:-}"; do
         [[ -n "$rp" ]] && set_runtime_auto "$rp"
     done
+    unload_nvidia
     sleep 1
 
     state=$(dgps_state 2>/dev/null || true)
@@ -636,12 +711,13 @@ switch_hybrid() {
     ok "NVIDIA device present: $dev"
     target_dev=$dev
 
-    info "Step 4/4: load NVIDIA modules"
+    info "Step 4/4: load NVIDIA modules and start power-management services"
     if load_nvidia; then
         ok "NVIDIA driver stack loaded or dry-run accepted"
     else
         warn "NVIDIA device is present, but driver stack did not load"
     fi
+    start_nvidia_services
 
     all_devs=$(find_nvidia_devices || true)
     while IFS= read -r dev; do
